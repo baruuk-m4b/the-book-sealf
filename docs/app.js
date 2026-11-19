@@ -20,7 +20,7 @@ let auth, db, uid = null, unsub = null;
 
 const CATS = { reading: "Currently reading", kobo: "In Kobo", library: "Library", queue: "Queue", interested: "Interested" };
 
-const S = { books: [], tab: "reading", type: "all", sort: "recent", q: "", searchKind: "book", results: null, searching: false, onlineQ: "" };
+const S = { books: [], tab: "reading", type: "all", sort: "recent", q: "", searchKind: "book", results: null, searching: false, onlineQ: "", page: 0, more: false, loadingMore: false, pool: new Map(), pq: null };
 
 // Books carry a list of categories. Older saves had one category (or status + kobo flag): convert them.
 const STATUS_CATS = ["reading", "queue", "interested"];
@@ -96,26 +96,59 @@ function findExisting(d) {
 }
 
 /* ---------- Search providers ---------- */
-async function searchGoogle(q) {
-  const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=20&printType=books`);
-  if (!r.ok) throw new Error("google " + r.status);
-  const j = await r.json();
-  return (j.items || []).map(it => {
-    const v = it.volumeInfo || {};
-    const s = parseSeries(v.title, v.subtitle);
-    const cover = (v.imageLinks?.thumbnail || v.imageLinks?.smallThumbnail || "").replace("http://", "https://");
-    return {
-      source: "gb", sid: it.id, type: "book", title: v.title || "Untitled",
-      authors: v.authors || [], synopsis: stripHtml(v.description), cover,
-      series: s.series, number: s.number, meta: v.publishedDate ? v.publishedDate.slice(0, 4) : ""
-    };
-  });
+const lev = (a, b) => {
+  const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+};
+const sim = (a, b) => (a || b ? 1 - lev(a, b) / Math.max(a.length, b.length) : 0);
+
+// "ruin by john gwynne" -> { title: "ruin", author: "john gwynne" }
+function parseQuery(q) {
+  const m = q.trim().match(/^(.+)\s+by\s+(.+)$/i);
+  return m ? { title: m[1].trim(), author: m[2].trim() } : { title: q.trim(), author: "" };
 }
-async function searchOpenLibrary(q) {
-  const r = await fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=20&fields=key,title,subtitle,author_name,cover_i,first_publish_year`);
+// How closely a result's authors match the author typed (0 to 1), forgiving of small typos.
+function authorSim(r, pq) {
+  const aq = norm(pq.author).split(" ").filter(Boolean);
+  if (!aq.length) return 0;
+  return Math.max(0, ...(r.authors || []).map(n => {
+    const nt = norm(n).split(" ");
+    return aq.reduce((s, tok) => s + Math.max(0, ...nt.map(x => sim(tok, x))), 0) / aq.length;
+  }));
+}
+function score(r, pq) {
+  const t = norm(pq.title), rt = norm(r.title);
+  let ts = rt === t ? 3 : rt.startsWith(t) ? 2.2 : rt.includes(t) ? 1.5 : 0;
+  if (!ts) { const qt = t.split(" ").filter(Boolean), set = new Set(rt.split(" ")); ts = qt.length ? qt.filter(x => set.has(x)).length / qt.length : 0; }
+  return ts * 2 + (pq.author ? authorSim(r, pq) * 2.5 : 0) + (r.synopsis ? 0.2 : 0) + (r.cover ? 0.1 : 0);
+}
+
+function mapGoogle(it) {
+  const v = it.volumeInfo || {};
+  const s = parseSeries(v.title, v.subtitle);
+  const cover = (v.imageLinks?.thumbnail || v.imageLinks?.smallThumbnail || "").replace("http://", "https://");
+  const num = s.number || v.seriesInfo?.bookDisplayNumber || "";
+  return {
+    source: "gb", sid: it.id, type: "book", title: v.title || "Untitled",
+    authors: v.authors || [], synopsis: stripHtml(v.description), cover,
+    series: s.series, number: num, meta: v.publishedDate ? v.publishedDate.slice(0, 4) : ""
+  };
+}
+async function googleQuery(q, start) {
+  const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=20&startIndex=${start}&printType=books`);
+  if (!r.ok) throw new Error("google " + r.status);
+  return ((await r.json()).items || []).map(mapGoogle);
+}
+async function olQuery(params, offset) {
+  const r = await fetch(`https://openlibrary.org/search.json?${params}&limit=20&offset=${offset}&fields=key,title,subtitle,author_name,cover_i,first_publish_year`);
   if (!r.ok) throw new Error("ol " + r.status);
-  const j = await r.json();
-  return (j.docs || []).map(d => {
+  return ((await r.json()).docs || []).map(d => {
     const s = parseSeries(d.title, d.subtitle);
     return {
       source: "ol", sid: d.key, type: "book", title: d.title, authors: d.author_name || [], synopsis: "",
@@ -124,22 +157,26 @@ async function searchOpenLibrary(q) {
     };
   });
 }
-async function searchBooks(q) {
-  let res = [];
-  try { res = await searchGoogle(q); } catch { /* fall back below */ }
-  if (!res.length) { try { res = await searchOpenLibrary(q); } catch { /* ignore */ } }
-  const seen = new Set();
-  return res.filter(b => { const k = norm(b.title) + "|" + norm(b.authors[0]); if (seen.has(k)) return false; seen.add(k); return true; });
+// Runs several searches at once (exact title+author, title only, loose) across both services.
+async function searchBooks(q, page) {
+  const pq = parseQuery(q), enc = encodeURIComponent, off = page * 20;
+  const g = pq.author ? [`intitle:${pq.title} inauthor:${pq.author}`, pq.title, `${pq.title} ${pq.author}`] : [q];
+  const o = pq.author ? [`title=${enc(pq.title)}&author=${enc(pq.author)}`, `q=${enc(pq.title)}`] : [`q=${enc(q)}`];
+  const jobs = [...g.map(x => googleQuery(x, off)), ...o.map(x => olQuery(x, off))];
+  const done = (await Promise.allSettled(jobs)).filter(s => s.status === "fulfilled");
+  if (!done.length) throw new Error("all searches failed");
+  const items = done.flatMap(s => s.value);
+  return { items, more: items.length > 0 && page < 4, pq };
 }
-async function searchManga(q) {
-  const query = `query($q:String){Page(perPage:20){media(search:$q,type:MANGA,sort:SEARCH_MATCH){id format status volumes chapters title{romaji english} description(asHtml:false) coverImage{large} staff(perPage:4,sort:RELEVANCE){edges{role node{name{full}}}}}}}`;
+async function searchManga(q, page) {
+  const query = `query($q:String,$p:Int){Page(page:$p,perPage:20){pageInfo{hasNextPage} media(search:$q,type:MANGA,sort:SEARCH_MATCH){id format status volumes chapters title{romaji english} description(asHtml:false) coverImage{large} staff(perPage:4,sort:RELEVANCE){edges{role node{name{full}}}}}}}`;
   const r = await fetch("https://graphql.anilist.co", {
     method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ query, variables: { q } })
+    body: JSON.stringify({ query, variables: { q, p: page + 1 } })
   });
   if (!r.ok) throw new Error("anilist " + r.status);
   const j = await r.json();
-  return (j.data?.Page?.media || []).map(m => {
+  const items = (j.data?.Page?.media || []).map(m => {
     const edges = m.staff?.edges || [];
     let names = edges.filter(e => /story|art/i.test(e.role)).map(e => e.node.name.full);
     if (!names.length) names = edges.slice(0, 1).map(e => e.node.name.full);
@@ -150,6 +187,18 @@ async function searchManga(q) {
       synopsis: stripHtml(m.description), cover: m.coverImage?.large || "", series: title, number: "", meta: bits.join(" · ")
     };
   });
+  return { items, more: !!j.data?.Page?.pageInfo?.hasNextPage, pq: parseQuery(q) };
+}
+
+// Merge new results into the pool; duplicates (same title + author) are combined so the richest data wins.
+function addToPool(items) {
+  for (const r of items) {
+    const key = norm(r.title) + "|" + norm(r.authors[0]);
+    const cur = S.pool.get(key);
+    if (!cur) { S.pool.set(key, r); continue; }
+    for (const f of ["synopsis", "cover", "series", "number", "meta"]) if (!cur[f] && r[f]) cur[f] = r[f];
+    if (cur.source === "ol" && r.source === "gb") { cur.source = r.source; cur.sid = r.sid; }
+  }
 }
 
 /* ---------- Rendering ---------- */
@@ -218,36 +267,50 @@ function renderSearch() {
     </div>
     <div id="results"></div>
     <button class="btn block" id="manual" style="margin-top:6px">Add manually (for sideloaded files)</button>`;
-  view.querySelectorAll("[data-kind]").forEach(b => (b.onclick = () => { S.searchKind = b.dataset.kind; S.results = null; S.onlineQ = ""; renderSearch(); }));
+  view.querySelectorAll("[data-kind]").forEach(b => (b.onclick = () => { S.searchKind = b.dataset.kind; S.results = null; S.onlineQ = ""; S.more = false; renderSearch(); }));
   view.querySelectorAll(".book[data-id]").forEach(b => (b.onclick = () => openSheet(S.books.find(x => x.id === b.dataset.id))));
   $("#online").onclick = runOnline;
   $("#manual").onclick = () => openSheet({ ...blank(), title: S.q.trim() });
   paintResults();
 }
 
-async function runOnline() {
+async function runOnline(more = false) {
   const q = S.q.trim(); if (!q) return;
-  S.onlineQ = q; S.searching = true; S.results = null; render();
-  let res;
-  try { res = await (S.searchKind === "manga" ? searchManga(q) : searchBooks(q)); } catch { res = "error"; }
-  if (S.onlineQ !== q) return; // a newer search replaced this one
-  S.searching = false; S.results = res; render();
+  if (more) { if (S.loadingMore || !S.more) return; S.loadingMore = true; }
+  else { S.onlineQ = q; S.page = 0; S.pool = new Map(); S.more = false; S.searching = true; S.results = null; }
+  render();
+  try {
+    const out = await (S.searchKind === "manga" ? searchManga(q, S.page) : searchBooks(q, S.page));
+    if (S.onlineQ !== q) return; // a newer search replaced this one
+    S.page++; S.more = out.more; S.pq = out.pq;
+    addToPool(out.items);
+    let list = [...S.pool.values()];
+    if (S.searchKind === "book") list = list.map(r => [score(r, out.pq), r]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+    S.results = list;
+  } catch { if (more) toast("Couldn't load more"); else S.results = "error"; }
+  S.searching = false; S.loadingMore = false; render();
 }
 
 function paintResults() {
   const box = $("#results"); if (!box) return;
   if (S.searching) { box.innerHTML = `<p class="hint">Searching…</p>`; return; }
   if (S.results === "error") { box.innerHTML = `<p class="hint">Search failed. Check your connection and try again, or add it manually.</p>`; return; }
-  if (!S.results) { box.innerHTML = `<p class="hint">Press Enter or tap Search online to see synopsis, author and series.</p>`; return; }
+  if (!S.results) { box.innerHTML = `<p class="hint">Press Enter or tap Search online. Tip: type the title and author together, like “Ruin by John Gwynne”.</p>`; return; }
   if (!S.results.length) { box.innerHTML = `<p class="hint">No results. Try fewer words, or add it manually.</p>`; return; }
-  box.innerHTML = `<div class="list">${S.results.map((r, i) => {
-    const ex = findExisting(r);
-    return `<button class="book" data-i="${i}">${card(ex || r, !!ex)}</button>`;
-  }).join("")}</div><div style="height:14px"></div>`;
+  const weak = S.searchKind === "book" && S.pq?.author && Math.max(...S.results.map(r => authorSim(r, S.pq))) < 0.7;
+  box.innerHTML = `
+    ${weak ? `<p class="hint">No close match for the author “${esc(S.pq.author)}”. Showing the closest titles; check the spelling, or tap Show more results.</p>` : ""}
+    <div class="list">${S.results.map((r, i) => {
+      const ex = findExisting(r);
+      return `<button class="book" data-i="${i}">${card(ex || r, !!ex)}</button>`;
+    }).join("")}</div>
+    ${S.more ? `<button class="btn block" id="more" style="margin-top:10px" ${S.loadingMore ? "disabled" : ""}>${S.loadingMore ? "Loading…" : "Show more results"}</button>` : ""}
+    <div style="height:14px"></div>`;
   box.querySelectorAll(".book").forEach(b => (b.onclick = () => {
     const r = S.results[+b.dataset.i];
     openSheet(findExisting(r) || { ...r, id: newId(), cats: defaultCats(), addedAt: 0 });
   }));
+  const more = $("#more"); if (more) more.onclick = () => runOnline(true);
 }
 
 // Search bar (lives in the header, so typing never loses focus)
