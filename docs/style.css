@@ -163,3 +163,8 @@ textarea { resize: vertical; min-height: 130px; line-height: 1.5; }
 .handle:hover { background: var(--chip); }
 .book.drag { position: relative; z-index: 2; border-color: var(--accent); box-shadow: 0 8px 22px rgba(0,0,0,.22); transform: scale(1.015); }
 .book.drag .handle { cursor: grabbing; }
+
+/* Cover picker */
+#cv-prev { flex: none; cursor: pointer; }
+.row.covers { margin: -2px 0 14px; flex-wrap: wrap; }
+.row.covers .btn { padding: 8px 10px; font-size: .9rem; }

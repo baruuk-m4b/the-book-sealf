@@ -11,7 +11,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
-const APP_VERSION = 5;
+const APP_VERSION = 6;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -410,6 +410,22 @@ $("#q").oninput = e => {
 };
 
 /* ---------- Book page (add / edit) ---------- */
+// Shrinks a chosen image to a small JPEG (longest side 420px) so it can be stored with the book.
+function fileToCover(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 420 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(img.width * k)); c.height = Math.max(1, Math.round(img.height * k));
+      const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url); resolve(c.toDataURL("image/jpeg", 0.78));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("bad image")); };
+    img.src = url;
+  });
+}
+
 const blank = () => ({
   id: newId(), source: "", sid: "", type: S.searchKind === "manga" ? "manga" : "book", title: "", authors: [], synopsis: "", cover: "",
   series: "", number: "", meta: "", cats: defaultCats(), addedAt: 0
@@ -422,11 +438,17 @@ function openSheet(b) {
   const sheet = $("#sheet");
   sheet.innerHTML = `
     <div class="sheet-head">
-      ${d.cover ? `<img class="cover" src="${esc(d.cover)}" alt="" referrerpolicy="no-referrer">` : `<div class="cover">${esc((d.title || "+").trim()[0] || "+")}</div>`}
+      <div id="cv-prev" title="Tap to choose a cover"></div>
       <div class="info" style="flex:1">
         <label class="f"><span>Title</span><input type="text" id="f-title" value="${esc(d.title)}"></label>
       </div>
     </div>
+    <div class="row covers">
+      <button type="button" class="btn" id="cv-up">Upload cover</button>
+      <button type="button" class="btn" id="cv-link">Paste link</button>
+      <button type="button" class="btn danger" id="cv-del">Remove cover</button>
+    </div>
+    <input type="file" id="cv-file" accept="image/*" hidden>
     <div class="row">
       <label class="f"><span>Series</span><input type="text" id="f-series" value="${esc(d.series)}" placeholder="Not part of a series"></label>
       <label class="f narrow"><span>No.</span><input type="text" id="f-number" value="${esc(d.number)}" inputmode="decimal" placeholder="#"></label>
@@ -446,6 +468,25 @@ function openSheet(b) {
   $("#scrim").hidden = false; sheet.hidden = false; sheet.scrollTop = 0;
   history.pushState({ sheet: 1 }, "");
 
+  const paintCover = () => {
+    $("#cv-prev").innerHTML = d.cover
+      ? `<img class="cover" src="${esc(d.cover)}" alt="" referrerpolicy="no-referrer">`
+      : `<div class="cover">${esc(($("#f-title").value || "+").trim()[0] || "+")}</div>`;
+    $("#cv-del").hidden = !d.cover;
+  };
+  paintCover();
+  $("#cv-up").onclick = $("#cv-prev").onclick = () => $("#cv-file").click();
+  $("#cv-file").onchange = async e => {
+    const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+    try { d.cover = await fileToCover(f); paintCover(); toast("Cover added. Tap Save to keep it."); }
+    catch { toast("Couldn't read that image"); }
+  };
+  $("#cv-link").onclick = () => {
+    const u = prompt("Paste the image link (starts with https://)");
+    if (u === null) return;
+    if (/^https?:\/\//i.test(u.trim())) { d.cover = u.trim(); paintCover(); } else toast("That doesn't look like an image link");
+  };
+  $("#cv-del").onclick = () => { d.cover = ""; paintCover(); };
   const paintCats = () => sheet.querySelectorAll("#cats button").forEach(x => x.classList.toggle("on", d.cats.includes(x.dataset.c)));
   paintCats();
   sheet.querySelectorAll("#cats button").forEach(btn => (btn.onclick = () => {
