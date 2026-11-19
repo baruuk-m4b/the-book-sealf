@@ -11,6 +11,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
+const APP_VERSION = 4;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -269,7 +270,7 @@ function renderSearch() {
     <button class="btn block" id="manual" style="margin-top:6px">Add manually (for sideloaded files)</button>`;
   view.querySelectorAll("[data-kind]").forEach(b => (b.onclick = () => { S.searchKind = b.dataset.kind; S.results = null; S.onlineQ = ""; S.more = false; renderSearch(); }));
   view.querySelectorAll(".book[data-id]").forEach(b => (b.onclick = () => openSheet(S.books.find(x => x.id === b.dataset.id))));
-  $("#online").onclick = runOnline;
+  $("#online").onclick = () => runOnline(false);
   $("#manual").onclick = () => openSheet({ ...blank(), title: S.q.trim() });
   paintResults();
 }
@@ -314,7 +315,7 @@ function paintResults() {
 }
 
 // Search bar (lives in the header, so typing never loses focus)
-$("#sform").onsubmit = e => { e.preventDefault(); $("#q").blur(); runOnline(); };
+$("#sform").onsubmit = e => { e.preventDefault(); $("#q").blur(); runOnline(false); };
 $("#q").oninput = e => {
   S.q = e.target.value;
   if (S.q.trim() !== S.onlineQ) { S.results = null; S.searching = false; }
@@ -418,7 +419,7 @@ $("#menuBtn").onclick = () => {
   const sheet = $("#sheet");
   sheet.innerHTML = `
     <label class="f"><span>Signed in as ${esc(auth?.currentUser?.email || "")}</span></label>
-    <p class="hint">${S.books.length} items in your library.</p>
+    <p class="hint">${S.books.length} items on your shelf. App version ${APP_VERSION}.</p>
     <div class="actions" style="margin-bottom:14px">
       <button class="btn" id="exp">Copy backup</button>
       <button class="btn" id="imp">Restore backup</button>
