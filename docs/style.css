@@ -152,3 +152,14 @@ textarea { resize: vertical; min-height: 130px; line-height: 1.5; }
   position: fixed; left: 50%; bottom: calc(86px + env(safe-area-inset-bottom, 0)); transform: translateX(-50%);
   background: var(--ink); color: var(--paper); padding: 9px 16px; border-radius: 99px; z-index: 30; font-size: .9rem;
 }
+
+/* Reorder mode */
+.book, .book * { -webkit-touch-callout: none; }
+.book:not(.reord) { user-select: none; -webkit-user-select: none; }
+.reorder-bar { display: flex; align-items: center; gap: 12px; margin: 4px 0 14px; padding: 10px 12px; background: var(--chip); border-radius: 12px; font-size: .88rem; color: var(--muted); }
+.reorder-bar span { flex: 1; }
+.book.reord { cursor: default; }
+.handle { flex: none; align-self: center; display: grid; place-items: center; width: 44px; height: 56px; margin: -4px -4px -4px 0; color: var(--muted); cursor: grab; touch-action: none; border-radius: 10px; }
+.handle:hover { background: var(--chip); }
+.book.drag { position: relative; z-index: 2; border-color: var(--accent); box-shadow: 0 8px 22px rgba(0,0,0,.22); transform: scale(1.015); }
+.book.drag .handle { cursor: grabbing; }

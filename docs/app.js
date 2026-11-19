@@ -11,7 +11,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -21,7 +21,11 @@ let auth, db, uid = null, unsub = null;
 
 const CATS = { reading: "Currently reading", kobo: "In Kobo", library: "Library", queue: "Queue", interested: "Interested" };
 
-const S = { books: [], tab: "reading", type: "all", sort: "recent", q: "", searchKind: "book", results: null, searching: false, onlineQ: "", page: 0, more: false, loadingMore: false, pool: new Map(), pq: null };
+const loadSorts = () => { try { return JSON.parse(localStorage.getItem("shelf.sorts") || "{}"); } catch { return {}; } };
+const saveSorts = () => { try { localStorage.setItem("shelf.sorts", JSON.stringify(S.sorts)); } catch { /* storage unavailable */ } };
+const sortFor = t => S.sorts[t] || (t === "queue" ? "custom" : "recent");
+
+const S = { books: [], tab: "reading", type: "all", sorts: loadSorts(), reorder: false, dragging: false, q: "", searchKind: "book", results: null, searching: false, onlineQ: "", page: 0, more: false, loadingMore: false, pool: new Map(), pq: null };
 
 // Books carry a list of categories. Older saves had one category (or status + kobo flag): convert them.
 const STATUS_CATS = ["reading", "queue", "interested"];
@@ -54,7 +58,7 @@ if (!configured) {
       const el = $("#sync");
       el.className = "sync " + (snap.metadata.fromCache && !navigator.onLine ? "off" : "ok");
       el.title = el.classList.contains("ok") ? "Synced" : "Offline: changes will sync when you reconnect";
-      render();
+      if (!S.dragging) render();
     }, err => toast("Sync error: " + err.code));
     render();
   });
@@ -210,8 +214,15 @@ function visibleBooks() {
     recent: (a, b) => (b.addedAt || 0) - (a.addedAt || 0),
     title: (a, b) => a.title.localeCompare(b.title),
     author: (a, b) => (a.authors?.[0] || "").localeCompare(b.authors?.[0] || ""),
-    series: (a, b) => (a.series || "\uffff").localeCompare(b.series || "\uffff") || (parseFloat(a.number) || 0) - (parseFloat(b.number) || 0) || a.title.localeCompare(b.title)
-  }[S.sort];
+    series: (a, b) => (a.series || "\uffff").localeCompare(b.series || "\uffff") || (parseFloat(a.number) || 0) - (parseFloat(b.number) || 0) || a.title.localeCompare(b.title),
+    custom: (a, b) => {
+      const pa = a.pos?.[S.tab], pb = b.pos?.[S.tab];
+      if (pa != null && pb != null) return pa - pb;
+      if (pa != null) return -1;
+      if (pb != null) return 1;
+      return (a.addedAt || 0) - (b.addedAt || 0); // unplaced books go to the end, oldest first
+    }
+  }[sortFor(S.tab)];
   return list.sort(by);
 }
 
@@ -229,28 +240,104 @@ function card(b, showCat) {
 function render() {
   if (!uid) return;
   const searching = S.q.trim().length > 0;
+  if (searching) S.reorder = false;
   $("#title").textContent = searching ? "Search" : CATS[S.tab];
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", !searching && b.dataset.tab === S.tab));
   searching ? renderSearch() : renderLibrary();
 }
 
+const GRIP = `<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><circle cx="9" cy="6" r="1.7"/><circle cx="15" cy="6" r="1.7"/><circle cx="9" cy="12" r="1.7"/><circle cx="15" cy="12" r="1.7"/><circle cx="9" cy="18" r="1.7"/><circle cx="15" cy="18" r="1.7"/></svg>`;
+
 function renderLibrary() {
   const view = $("#view");
   const list = visibleBooks();
+  const sort = sortFor(S.tab);
   const typed = (k, l) => `<button data-type="${k}" class="${S.type === k ? "on" : ""}">${l}</button>`;
   const hasAny = S.books.some(b => b.cats.includes(S.tab));
-  view.innerHTML = `
-    ${hasAny ? `<div class="toolbar">
+  const bar = S.reorder
+    ? `<div class="reorder-bar"><span>Drag the handle on the right to move a book. It saves when you let go.</span><button class="btn primary" id="done">Done</button></div>`
+    : hasAny ? `<div class="toolbar">
       <div class="seg">${typed("all", "All")}${typed("book", "Books")}${typed("manga", "Manga")}</div>
       <select id="sort" aria-label="Sort">
-        ${[["recent", "Recently added"], ["title", "Title"], ["author", "Author"], ["series", "Series"]].map(([v, l]) => `<option value="${v}" ${S.sort === v ? "selected" : ""}>${l}</option>`).join("")}
+        ${[["recent", "Recently added"], ["custom", "My order"], ["title", "Title"], ["author", "Author"], ["series", "Series"]].map(([v, l]) => `<option value="${v}" ${sort === v ? "selected" : ""}>${l}</option>`).join("")}
       </select>
-    </div>` : ""}
-    <div class="list">${list.map(b => `<button class="book" data-id="${esc(b.id)}">${card(b, false)}</button>`).join("")}</div>
+      <button class="btn" id="reorder">Reorder</button>
+    </div>` : "";
+  const items = list.map(b => S.reorder
+    ? `<div class="book reord" data-id="${esc(b.id)}">${card(b, false)}<span class="handle" aria-label="Drag to reorder">${GRIP}</span></div>`
+    : `<button class="book" data-id="${esc(b.id)}">${card(b, false)}</button>`).join("");
+  view.innerHTML = `${bar}
+    <div class="list">${items}</div>
     ${!list.length ? `<div class="empty"><b>${hasAny ? "Nothing matches" : "Nothing here yet"}</b>${hasAny ? "Try a different filter." : (S.tab === "library" ? "Every book you have read will be listed here. Find one with the search bar, or tick Library on a book." : "Use the search bar to find a book or manga and add it here.")}</div>` : ""}`;
+
+  if (S.reorder) { $("#done").onclick = () => { S.reorder = false; renderLibrary(); }; setupDrag(); return; }
+
   view.querySelectorAll("[data-type]").forEach(b => (b.onclick = () => { S.type = b.dataset.type; renderLibrary(); }));
-  view.querySelectorAll(".book").forEach(b => (b.onclick = () => openSheet(S.books.find(x => x.id === b.dataset.id))));
-  const sort = $("#sort"); if (sort) sort.onchange = e => { S.sort = e.target.value; renderLibrary(); };
+  const sel = $("#sort"); if (sel) sel.onchange = e => { S.sorts[S.tab] = e.target.value; saveSorts(); renderLibrary(); };
+  const rb = $("#reorder"); if (rb) rb.onclick = enterReorder;
+
+  // Tap opens a book; press and hold starts reorder mode.
+  view.querySelectorAll(".book").forEach(b => {
+    let timer, fired = false, sx = 0, sy = 0;
+    b.onpointerdown = e => { fired = false; sx = e.clientX; sy = e.clientY; timer = setTimeout(() => { fired = true; navigator.vibrate?.(25); enterReorder(); }, 550); };
+    b.onpointermove = e => { if (Math.hypot(e.clientX - sx, e.clientY - sy) > 10) clearTimeout(timer); };
+    b.onpointerup = b.onpointercancel = b.onpointerleave = () => clearTimeout(timer);
+    b.oncontextmenu = e => e.preventDefault();
+    b.onclick = () => { if (fired) { fired = false; return; } openSheet(S.books.find(x => x.id === b.dataset.id)); };
+  });
+}
+
+// Save a new order for the current tab (optimistic locally, then to Firestore).
+async function writeOrder(ids) {
+  const tab = S.tab;
+  ids.forEach((id, i) => { const b = S.books.find(x => x.id === id); if (b) b.pos = { ...(b.pos || {}), [tab]: i }; });
+  try {
+    for (let i = 0; i < ids.length; i += 400) {
+      const batch = writeBatch(db);
+      ids.slice(i, i + 400).forEach((id, j) => batch.set(doc(db, "users", uid, "books", id), { pos: { [tab]: i + j } }, { merge: true }));
+      await batch.commit();
+    }
+  } catch { toast("Couldn't save the order"); }
+}
+
+function enterReorder() {
+  if (S.reorder) return;
+  S.type = "all"; // reorder the whole list, not a filtered slice
+  const ids = visibleBooks().map(b => b.id); // the order you can see right now
+  const unplaced = ids.some(id => S.books.find(b => b.id === id).pos?.[S.tab] == null);
+  if (sortFor(S.tab) !== "custom" || unplaced) { S.sorts[S.tab] = "custom"; saveSorts(); writeOrder(ids); }
+  S.reorder = true; renderLibrary();
+}
+
+function setupDrag() {
+  const list = $(".list"); if (!list) return;
+  list.querySelectorAll(".handle").forEach(h => {
+    h.onpointerdown = e => {
+      e.preventDefault();
+      const item = h.closest(".book");
+      item.classList.add("drag"); S.dragging = true;
+      h.setPointerCapture(e.pointerId);
+      let y = e.clientY, raf;
+      const place = () => {
+        const next = [...list.children].filter(c => c !== item).find(c => { const r = c.getBoundingClientRect(); return y < r.top + r.height / 2; });
+        if (next) { if (item.nextElementSibling !== next) list.insertBefore(item, next); }
+        else if (item !== list.lastElementChild) list.appendChild(item);
+      };
+      const tick = () => {
+        if (y < 140) window.scrollBy(0, -14); else if (y > innerHeight - 110) window.scrollBy(0, 14);
+        place(); raf = requestAnimationFrame(tick);
+      };
+      h.onpointermove = ev => { y = ev.clientY; };
+      const end = () => {
+        cancelAnimationFrame(raf); item.classList.remove("drag");
+        h.onpointermove = h.onpointerup = h.onpointercancel = null;
+        writeOrder([...list.children].map(c => c.dataset.id));
+        S.dragging = false;
+      };
+      h.onpointerup = h.onpointercancel = end;
+      raf = requestAnimationFrame(tick);
+    };
+  });
 }
 
 function renderSearch() {
@@ -448,5 +535,5 @@ $("#menuBtn").onclick = () => {
 /* ---------- Tabs ---------- */
 $("#tabs").onclick = e => {
   const b = e.target.closest("button"); if (!b) return;
-  S.tab = b.dataset.tab; S.q = ""; $("#q").value = ""; S.results = null; S.onlineQ = ""; render(); window.scrollTo(0, 0);
+  S.reorder = false; S.tab = b.dataset.tab; S.q = ""; $("#q").value = ""; S.results = null; S.onlineQ = ""; render(); window.scrollTo(0, 0);
 };
